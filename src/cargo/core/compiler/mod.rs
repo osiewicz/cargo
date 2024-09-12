@@ -65,7 +65,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Error};
+use cargo_util::{paths, ProcessBuilder, ProcessError};
+use cargo_util_schemas::manifest::{TomlDebugInfo, TomlTrimPaths, TomlTrimPathsValue};
+use fingerprint::FsStatus;
 use lazycell::LazyCell;
+use rustfix::diagnostics::Applicability;
 use tracing::{debug, trace};
 
 pub use self::build_config::{BuildConfig, CompileMode, MessageFormat, TimingOutput};
@@ -77,8 +81,7 @@ pub use self::build_runner::{BuildRunner, Metadata, UnitHash};
 pub use self::compilation::{Compilation, Doctest, UnitOutput};
 pub use self::compile_kind::{CompileKind, CompileTarget};
 pub use self::crate_type::CrateType;
-pub use self::custom_build::LinkArgTarget;
-pub use self::custom_build::{BuildOutput, BuildScriptOutputs, BuildScripts};
+pub use self::custom_build::{BuildOutput, BuildScriptOutputs, BuildScripts, LinkArgTarget};
 pub(crate) use self::fingerprint::DirtyReason;
 pub use self::job_queue::Freshness;
 use self::job_queue::{Job, JobQueue, JobState, Work};
@@ -96,11 +99,6 @@ use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message};
 use crate::util::{add_path_args, internal};
-use cargo_util::{paths, ProcessBuilder, ProcessError};
-use cargo_util_schemas::manifest::TomlDebugInfo;
-use cargo_util_schemas::manifest::TomlTrimPaths;
-use cargo_util_schemas::manifest::TomlTrimPathsValue;
-use rustfix::diagnostics::Applicability;
 
 const RUSTDOC_CRATE_VERSION_FLAG: &str = "--crate-version";
 
@@ -193,12 +191,60 @@ fn compile<'gctx>(
     } else {
         let force = exec.force_rebuild(unit) || force_rebuild;
         let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-        job.before(if job.freshness().is_dirty() {
-            let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+        job.before(if let Freshness::Dirty(reason) = job.freshness() {
+            let rustc_work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                 rustdoc(build_runner, unit)?
             } else {
                 rustc(build_runner, unit, exec)?
             };
+            let rustc_clean_job = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                Work::noop()
+            } else {
+                rustc_noop(build_runner, unit, exec)?
+            };
+            let is_outdated_dep = matches!(
+                reason,
+                DirtyReason::FsStatusOutdated(
+                    FsStatus::StaleDepFingerprint { .. } | FsStatus::StaleDependency { .. }
+                )
+            ) && unit.target.is_lib();
+            let all_dep_hashes = is_outdated_dep.then(|| {
+                let deps = build_runner.unit_deps(&unit).to_owned();
+                deps.into_iter()
+                    .map(|dep| {
+                        build_runner
+                            .api_hashes
+                            .entry(dep.unit.clone())
+                            .or_default()
+                            .clone()
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            let work = Work::new(move |state| {
+                let is_api_same = if let Some(all_deps) = all_dep_hashes {
+                    all_deps.into_iter().all(|hash| {
+                        let before_hash = hash.0.get();
+                        let after_hash = hash.1.get();
+                        let res = after_hash.is_none() || before_hash == after_hash;
+                        if !res {
+                            dbg!(&before_hash, &after_hash);
+                        }
+                        res
+                    })
+                } else {
+                    false
+                };
+
+                if !is_api_same {
+                    rustc_work.call(state)?;
+                } else {
+                    state.set_api_same();
+                    rustc_clean_job.call(state)?;
+                }
+                Ok(())
+            });
+
             work.then(link_targets(build_runner, unit, false)?)
         } else {
             // We always replay the output cache,
@@ -254,6 +300,27 @@ fn make_failed_scrape_diagnostic(
     )
 }
 
+fn rustc_noop(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    exec: &Arc<dyn Executor>,
+) -> CargoResult<Work> {
+    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+
+    exec.init(build_runner, unit);
+
+    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+
+    return Ok(Work::new(move |_| {
+        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+
+        // This mtime shift allows Cargo to detect if a source file was
+        // modified in the middle of the build.
+        paths::set_file_time_no_err(dep_info_loc, timestamp);
+
+        Ok(())
+    }));
+}
 /// Creates a unit of work invoking `rustc` for building the `unit`.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
@@ -606,6 +673,7 @@ fn link_targets(
                 test: unit_mode.is_any_test(),
             };
 
+            let fresh = fresh || state.is_api_same();
             let msg = machine_message::Artifact {
                 package_id: package_id.to_spec(),
                 manifest_path,
@@ -1247,7 +1315,7 @@ fn trim_paths_args_rustdoc(
     match trim_paths {
         // rustdoc supports diagnostics trimming only.
         TomlTrimPaths::Values(values) if !values.contains(&TomlTrimPathsValue::Diagnostics) => {
-            return Ok(())
+            return Ok(());
         }
         _ => {}
     }
@@ -1849,13 +1917,14 @@ fn on_stderr_line_inner(
     struct ArtifactNotification<'a> {
         #[serde(borrow)]
         artifact: Cow<'a, str>,
+        api_hash: Option<String>,
     }
 
     if let Ok(artifact) = serde_json::from_str::<ArtifactNotification<'_>>(compiler_message.get()) {
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
-            state.rmeta_produced();
+            state.rmeta_produced(artifact.api_hash);
         }
         return Ok(false);
     }
@@ -1894,7 +1963,6 @@ fn on_stderr_line_inner(
         message: compiler_message,
     }
     .to_json_string();
-
     // Switch json lines from rustc/rustdoc that appear on stderr to stdout
     // instead. We want the stdout of Cargo to always be machine parseable as
     // stderr has our colorized human-readable messages.

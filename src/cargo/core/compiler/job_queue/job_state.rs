@@ -47,6 +47,7 @@ pub struct JobState<'a, 'gctx> {
     /// sending a double message later on.
     rmeta_required: Cell<bool>,
 
+    api_same: Cell<bool>,
     // Historical versions of Cargo made use of the `'a` argument here, so to
     // leave the door open to future refactorings keep it here.
     _marker: marker::PhantomData<&'a ()>,
@@ -64,6 +65,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             messages,
             output,
             rmeta_required: Cell::new(rmeta_required),
+            api_same: Cell::new(false),
             _marker: marker::PhantomData,
         }
     }
@@ -138,10 +140,22 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// builds when required, and can be called at any time before a job ends.
     /// This should only be called once because a metadata file can only be
     /// produced once!
-    pub fn rmeta_produced(&self) {
+    pub fn rmeta_produced(&self, api_hash: Option<String>) {
         self.rmeta_required.set(false);
-        self.messages
-            .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        self.messages.push(Message::Finish(
+            self.id,
+            Artifact::Metadata,
+            Ok(()),
+            api_hash,
+        ));
+    }
+
+    pub fn set_api_same(&self) {
+        self.api_same.set(true);
+    }
+
+    pub fn is_api_same(&self) -> bool {
+        self.api_same.get()
     }
 
     /// Drives a [`Job`] to finish. This ensures that a [`Message::Finish`] is
@@ -168,7 +182,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         // send a synthetic message here.
         if self.rmeta_required.get() && sender.result.as_ref().unwrap().is_ok() {
             self.messages
-                .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+                .push(Message::Finish(self.id, Artifact::Metadata, Ok(()), None));
         }
 
         // Use a helper struct with a `Drop` implementation to guarantee
@@ -188,7 +202,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
                     .take()
                     .unwrap_or_else(|| Err(anyhow::format_err!("worker panicked")));
                 self.messages
-                    .push(Message::Finish(self.id, Artifact::All, result));
+                    .push(Message::Finish(self.id, Artifact::All, result, None));
             }
         }
     }

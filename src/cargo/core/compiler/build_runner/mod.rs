@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::compiler::compilation::{self, UnitOutput};
 use crate::core::compiler::{self, artifact, Unit};
@@ -48,6 +48,7 @@ pub struct BuildRunner<'a, 'gctx> {
     pub build_explicit_deps: HashMap<Unit, BuildDeps>,
     /// Fingerprints used to detect if a unit is out-of-date.
     pub fingerprints: HashMap<Unit, Arc<Fingerprint>>,
+    pub api_hashes: HashMap<Unit, Arc<(OnceLock<String>, OnceLock<String>)>>,
     /// Cache of file mtimes to reduce filesystem hits.
     pub mtime_cache: HashMap<PathBuf, FileTime>,
     /// Cache of file checksums to reduce filesystem reads.
@@ -119,6 +120,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             compiled: HashSet::new(),
             build_scripts: HashMap::new(),
             build_explicit_deps: HashMap::new(),
+            api_hashes: Default::default(),
             jobserver,
             primary_packages: HashSet::new(),
             files: None,

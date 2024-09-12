@@ -380,7 +380,7 @@ use std::fs::File;
 use std::hash::{self, Hash, Hasher};
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::format_err;
@@ -442,7 +442,8 @@ pub fn prepare_target(
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
-    let dirty_reason = compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force);
+    let dirty_reason =
+        compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force, build_runner);
 
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
@@ -514,6 +515,11 @@ pub fn prepare_target(
         let output_path = build_runner.build_explicit_deps[unit]
             .build_script_output
             .clone();
+        let api = build_runner
+            .api_hashes
+            .entry(unit.clone())
+            .or_default()
+            .clone();
         Work::new(move |_| {
             let outputs = build_script_outputs.lock().unwrap();
             let output = outputs
@@ -528,11 +534,15 @@ pub fn prepare_target(
             if let Some(new_local) = (gen_local)(&deps, None)? {
                 *fingerprint.local.lock().unwrap() = new_local;
             }
-
-            write_fingerprint(&loc, &fingerprint)
+            write_fingerprint(&loc, &fingerprint, api)
         })
     } else {
-        Work::new(move |_| write_fingerprint(&loc, &fingerprint))
+        let api = build_runner
+            .api_hashes
+            .entry(unit.clone())
+            .or_default()
+            .clone();
+        Work::new(move |_| write_fingerprint(&loc, &fingerprint, api))
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
@@ -557,6 +567,7 @@ struct DepFingerprint {
     /// The dependency's fingerprint we recursively point to, containing all the
     /// other hash information we'd otherwise need.
     fingerprint: Arc<Fingerprint>,
+    api_fingerprint: Option<String>,
 }
 
 /// A fingerprint can be considered to be a "short string" representing the
@@ -629,6 +640,7 @@ pub struct Fingerprint {
     /// fingerprints output files are regenerated and look newer than this one.
     #[serde(skip)]
     outputs: Vec<PathBuf>,
+    api_hash: Option<String>,
 }
 
 /// Indication of the status on the filesystem for a particular unit.
@@ -681,6 +693,7 @@ impl Serialize for DepFingerprint {
             &self.name,
             &self.public,
             &self.fingerprint.hash_u64(),
+            &self.api_fingerprint,
         )
             .serialize(ser)
     }
@@ -691,7 +704,8 @@ impl<'de> Deserialize<'de> for DepFingerprint {
     where
         D: de::Deserializer<'de>,
     {
-        let (pkg_id, name, public, hash) = <(u64, String, bool, u64)>::deserialize(d)?;
+        let (pkg_id, name, public, hash, api_fingerprint) =
+            <(u64, String, bool, u64, Option<String>)>::deserialize(d)?;
         Ok(DepFingerprint {
             pkg_id,
             name: InternedString::new(&name),
@@ -704,6 +718,7 @@ impl<'de> Deserialize<'de> for DepFingerprint {
             // `check_filesystem` which isn't used by fingerprints loaded from
             // disk.
             only_requires_rmeta: false,
+            api_fingerprint,
         })
     }
 }
@@ -725,7 +740,7 @@ impl<'de> Deserialize<'de> for DepFingerprint {
 /// when the filesystem contains stale information (based on mtime currently).
 /// The paths here don't change much between compilations but they're used as
 /// inputs when we probe the filesystem looking at information.
-#[derive(Debug, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 enum LocalFingerprint {
     /// This is a precalculated fingerprint which has an opaque string we just
     /// hash as usual. This variant is primarily used for rustdoc where we
@@ -950,6 +965,7 @@ impl Fingerprint {
             compile_kind: 0,
             fs_status: FsStatus::Stale,
             outputs: Vec::new(),
+            api_hash: None,
         }
     }
 
@@ -1236,6 +1252,7 @@ impl Fingerprint {
             // Note that this comparison should probably be `>=`, not `>`, but
             // for a discussion of why it's `>` see the discussion about #5918
             // below in `find_stale`.
+
             if dep_mtime > max_mtime {
                 info!(
                     "dependency on `{}` is newer than we are {} > {} {:?}",
@@ -1317,11 +1334,13 @@ impl hash::Hash for Fingerprint {
             public,
             fingerprint,
             only_requires_rmeta: _, // static property, no need to hash
+            api_fingerprint,
         } in deps
         {
             pkg_id.hash(h);
             name.hash(h);
             public.hash(h);
+            api_fingerprint.hash(h);
             // use memoized dep hashes to avoid exponential blowup
             h.write_u64(fingerprint.hash_u64());
         }
@@ -1351,12 +1370,17 @@ impl DepFingerprint {
             util::hash_u64(dep.unit.pkg.package_id())
         };
 
+        let api_fingerprint = build_runner
+            .api_hashes
+            .get(&dep.unit)
+            .and_then(|api_hashes| api_hashes.1.get().or(api_hashes.0.get()).cloned());
         Ok(DepFingerprint {
             pkg_id,
             name: dep.extern_crate_name,
             public: dep.public,
             fingerprint,
             only_requires_rmeta: build_runner.only_requires_rmeta(parent, &dep.unit),
+            api_fingerprint,
         })
     }
 }
@@ -1571,6 +1595,7 @@ fn calculate_normal(
         rustflags: extra_flags,
         fs_status: FsStatus::Stale,
         outputs,
+        api_hash: None,
     })
 }
 
@@ -1818,7 +1843,11 @@ fn local_fingerprints_deps(
 
 /// Writes the short fingerprint hash value to `<loc>`
 /// and logs detailed JSON information to `<loc>.json`.
-fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
+fn write_fingerprint(
+    loc: &Path,
+    fingerprint: &Fingerprint,
+    api_hash: Arc<(OnceLock<String>, OnceLock<String>)>,
+) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
     // fingerprint::new().rustc == 0, make sure it doesn't make it to the file system.
     // This is mostly so outside tools can reliably find out what rust version this file is for,
@@ -1826,8 +1855,35 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     let hash = fingerprint.hash_u64();
     debug!("write fingerprint ({:x}) : {}", hash, loc.display());
     paths::write(loc, util::to_hex(hash).as_bytes())?;
-
-    let json = serde_json::to_string(fingerprint).unwrap();
+    let api_hash = {
+        if let Some(hash) = api_hash.1.get() {
+            // We have a fresh hash from this session.
+            Some(hash.clone())
+        } else if let Some(hash) = api_hash.0.get() {
+            // Keep the same hash.
+            Some(hash.clone())
+        } else {
+            None
+        }
+    };
+    let fingerprint = Fingerprint {
+        api_hash,
+        rustc: fingerprint.rustc,
+        features: fingerprint.features.clone(),
+        declared_features: fingerprint.declared_features.clone(),
+        target: fingerprint.target,
+        profile: fingerprint.profile,
+        path: fingerprint.path,
+        deps: fingerprint.deps.clone(),
+        local: Mutex::new(fingerprint.local.lock().unwrap().clone()),
+        memoized_hash: Mutex::new(fingerprint.memoized_hash.lock().unwrap().clone()),
+        rustflags: fingerprint.rustflags.clone(),
+        config: fingerprint.config,
+        compile_kind: fingerprint.compile_kind,
+        fs_status: fingerprint.fs_status.clone(),
+        outputs: fingerprint.outputs.clone(),
+    };
+    let json = serde_json::to_string(&fingerprint).unwrap();
     if cfg!(debug_assertions) {
         let f: Fingerprint = serde_json::from_str(&json).unwrap();
         assert_eq!(f.hash_u64(), hash);
@@ -1870,6 +1926,7 @@ fn compare_old_fingerprint(
     new_fingerprint: &Fingerprint,
     mtime_on_use: bool,
     forced: bool,
+    build_runner: &mut BuildRunner<'_, '_>,
 ) -> Option<DirtyReason> {
     if mtime_on_use {
         // update the mtime so other cleaners know we used it
@@ -1878,7 +1935,7 @@ fn compare_old_fingerprint(
         paths::set_file_time_no_err(old_hash_path, t);
     }
 
-    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint);
+    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint, build_runner, unit);
 
     match compare.as_ref() {
         Ok(None) => {}
@@ -1908,6 +1965,8 @@ fn compare_old_fingerprint(
 fn _compare_old_fingerprint(
     old_hash_path: &Path,
     new_fingerprint: &Fingerprint,
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
 ) -> CargoResult<Option<DirtyReason>> {
     let old_fingerprint_short = paths::read(old_hash_path)?;
 
@@ -1920,6 +1979,16 @@ fn _compare_old_fingerprint(
     let old_fingerprint_json = paths::read(&old_hash_path.with_extension("json"))?;
     let old_fingerprint: Fingerprint = serde_json::from_str(&old_fingerprint_json)
         .with_context(|| internal("failed to deserialize json"))?;
+
+    if let Some(api) = &old_fingerprint.api_hash {
+        build_runner
+            .api_hashes
+            .entry(unit.clone())
+            .or_default()
+            .0
+            .set(api.clone())
+            .ok();
+    }
     // Fingerprint can be empty after a failed rebuild (see comment in prepare_target).
     if !old_fingerprint_short.is_empty() {
         debug_assert_eq!(
@@ -1927,7 +1996,6 @@ fn _compare_old_fingerprint(
             old_fingerprint_short
         );
     }
-
     Ok(Some(new_fingerprint.compare(&old_fingerprint)))
 }
 
@@ -1967,9 +2035,9 @@ where
     } else {
         None
     };
+
     for (path, prior_checksum) in paths {
         let path = path.as_ref();
-
         // Assuming anything in cargo_home/{git, registry} is immutable
         // (see also #9455 about marking the src directory readonly) which avoids rebuilds when CI
         // caches $CARGO_HOME/registry/{index, cache} and $CARGO_HOME/git/db across runs, keeping

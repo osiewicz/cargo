@@ -372,7 +372,7 @@ enum Message {
 
     FixDiagnostic(diagnostic_server::Message),
     Token(io::Result<Acquired>),
-    Finish(JobId, Artifact, CargoResult<()>),
+    Finish(JobId, Artifact, CargoResult<()>, Option<String>),
     FutureIncompatReport(JobId, Vec<FutureBreakageItem>),
 }
 
@@ -656,7 +656,7 @@ impl<'gctx> DrainState<'gctx> {
             Message::FixDiagnostic(msg) => {
                 self.print.print(&msg)?;
             }
-            Message::Finish(id, artifact, result) => {
+            Message::Finish(id, artifact, result, api_hash) => {
                 let unit = match artifact {
                     // If `id` has completely finished we remove it
                     // from the `active` map ...
@@ -677,6 +677,16 @@ impl<'gctx> DrainState<'gctx> {
                         self.active[&id].clone()
                     }
                 };
+                if let Some(hash) = api_hash.filter(|_| artifact == Artifact::Metadata) {
+                    build_runner
+                        .api_hashes
+                        .entry(unit.clone())
+                        .or_default()
+                        .1
+                        .set(hash)
+                        .unwrap();
+                }
+
                 debug!("end ({:?}): {:?}", unit, result);
                 match result {
                     Ok(()) => self.finish(id, &unit, artifact, build_runner)?,
