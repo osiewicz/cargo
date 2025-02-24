@@ -21,6 +21,7 @@ use crate::core::{
 use crate::core::{EitherManifest, Package, SourceId, VirtualManifest};
 use crate::ops;
 use crate::sources::{PathSource, SourceConfigMap, CRATES_IO_INDEX, CRATES_IO_REGISTRY};
+use crate::util::context::FeatureUnification;
 use crate::util::edit_distance;
 use crate::util::errors::{CargoResult, ManifestError};
 use crate::util::interning::InternedString;
@@ -112,7 +113,8 @@ pub struct Workspace<'gctx> {
     /// and other places that use rust version.
     /// This is set based on the resolver version, config settings, and CLI flags.
     resolve_honors_rust_version: bool,
-
+    /// The feature unification mode used when building packages.
+    resolve_feature_unification: FeatureUnification,
     /// Workspace-level custom metadata
     custom_metadata: Option<toml::Value>,
 
@@ -246,6 +248,7 @@ impl<'gctx> Workspace<'gctx> {
             requested_lockfile_path: None,
             resolve_behavior: ResolveBehavior::V1,
             resolve_honors_rust_version: false,
+            resolve_feature_unification: FeatureUnification::Selected,
             custom_metadata: None,
             local_overlays: HashMap::new(),
         }
@@ -269,10 +272,11 @@ impl<'gctx> Workspace<'gctx> {
         let mut ws = Workspace::new_default(package.manifest_path().to_path_buf(), gctx);
         ws.is_ephemeral = true;
         ws.require_optional_deps = require_optional_deps;
-        let key = ws.current_manifest.parent().unwrap();
         let id = package.package_id();
         let package = MaybePackage::Package(package);
-        ws.packages.packages.insert(key.to_path_buf(), package);
+        ws.packages
+            .packages
+            .insert(ws.current_manifest.clone(), package);
         ws.target_dir = if let Some(dir) = target_dir {
             Some(dir)
         } else {
@@ -306,13 +310,20 @@ impl<'gctx> Workspace<'gctx> {
                 }
             }
         }
-        if let CargoResolverConfig {
-            incompatible_rust_versions: Some(incompatible_rust_versions),
-        } = self.gctx().get::<CargoResolverConfig>("resolver")?
-        {
+        let config = self.gctx().get::<CargoResolverConfig>("resolver")?;
+        if let Some(incompatible_rust_versions) = config.incompatible_rust_versions {
             self.resolve_honors_rust_version =
                 incompatible_rust_versions == IncompatibleRustVersions::Fallback;
         }
+        if self.gctx().cli_unstable().feature_unification {
+            self.resolve_feature_unification = config
+                .feature_unification
+                .unwrap_or(FeatureUnification::Selected);
+        } else if config.feature_unification.is_some() {
+            self.gctx()
+                .shell()
+                .warn("ignoring `resolver.feature-unification` without `-Zfeature-unification`")?;
+        };
 
         Ok(())
     }
@@ -436,7 +447,7 @@ impl<'gctx> Workspace<'gctx> {
             BTreeMap<String, BTreeMap<String, TomlDependency<ConfigRelativePath>>>,
         > = self.gctx.get("patch")?;
 
-        let source = SourceId::for_path(self.root())?;
+        let source = SourceId::for_manifest_path(self.root_manifest())?;
 
         let mut warnings = Vec::new();
 
@@ -538,11 +549,7 @@ impl<'gctx> Workspace<'gctx> {
     /// Returns a mutable iterator over all packages in this workspace
     pub fn members_mut(&mut self) -> impl Iterator<Item = &mut Package> {
         let packages = &mut self.packages.packages;
-        let members: HashSet<_> = self
-            .members
-            .iter()
-            .map(|path| path.parent().unwrap().to_owned())
-            .collect();
+        let members: HashSet<_> = self.members.iter().map(|path| path).collect();
 
         packages.iter_mut().filter_map(move |(path, package)| {
             if members.contains(path) {
@@ -664,6 +671,14 @@ impl<'gctx> Workspace<'gctx> {
 
     pub fn resolve_honors_rust_version(&self) -> bool {
         self.resolve_honors_rust_version
+    }
+
+    pub fn set_resolve_feature_unification(&mut self, feature_unification: FeatureUnification) {
+        self.resolve_feature_unification = feature_unification;
+    }
+
+    pub fn resolve_feature_unification(&self) -> FeatureUnification {
+        self.resolve_feature_unification
     }
 
     pub fn custom_metadata(&self) -> Option<&toml::Value> {
@@ -1129,7 +1144,7 @@ impl<'gctx> Workspace<'gctx> {
         if let Some(p) = loaded.get(manifest_path).cloned() {
             return Ok(p);
         }
-        let source_id = SourceId::for_path(manifest_path.parent().unwrap())?;
+        let source_id = SourceId::for_manifest_path(manifest_path)?;
         let package = ops::read_package(manifest_path, source_id, self.gctx)?;
         loaded.insert(manifest_path.to_path_buf(), package.clone());
         Ok(package)
@@ -1163,7 +1178,6 @@ impl<'gctx> Workspace<'gctx> {
 
     pub fn emit_warnings(&self) -> CargoResult<()> {
         for (path, maybe_pkg) in &self.packages.packages {
-            let path = path.join("Cargo.toml");
             if let MaybePackage::Package(pkg) = maybe_pkg {
                 if self.gctx.cli_unstable().cargo_lints {
                     self.emit_lints(pkg, &path)?
@@ -1792,19 +1806,18 @@ impl<'gctx> Packages<'gctx> {
     }
 
     fn maybe_get(&self, manifest_path: &Path) -> Option<&MaybePackage> {
-        self.packages.get(manifest_path.parent().unwrap())
+        self.packages.get(manifest_path)
     }
 
     fn maybe_get_mut(&mut self, manifest_path: &Path) -> Option<&mut MaybePackage> {
-        self.packages.get_mut(manifest_path.parent().unwrap())
+        self.packages.get_mut(manifest_path)
     }
 
     fn load(&mut self, manifest_path: &Path) -> CargoResult<&MaybePackage> {
-        let key = manifest_path.parent().unwrap();
-        match self.packages.entry(key.to_path_buf()) {
+        match self.packages.entry(manifest_path.to_path_buf()) {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(v) => {
-                let source_id = SourceId::for_path(key)?;
+                let source_id = SourceId::for_manifest_path(manifest_path)?;
                 let manifest = read_manifest(manifest_path, source_id, self.gctx)?;
                 Ok(v.insert(match manifest {
                     EitherManifest::Real(manifest) => {
@@ -1962,8 +1975,7 @@ pub fn find_workspace_root(
     gctx: &GlobalContext,
 ) -> CargoResult<Option<PathBuf>> {
     find_workspace_root_with_loader(manifest_path, gctx, |self_path| {
-        let key = self_path.parent().unwrap();
-        let source_id = SourceId::for_path(key)?;
+        let source_id = SourceId::for_manifest_path(self_path)?;
         let manifest = read_manifest(self_path, source_id, gctx)?;
         Ok(manifest
             .workspace_config()

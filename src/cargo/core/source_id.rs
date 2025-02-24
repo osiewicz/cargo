@@ -204,6 +204,17 @@ impl SourceId {
         SourceId::new(SourceKind::Path, url, None)
     }
 
+    /// Creates a `SourceId` from a filesystem path.
+    ///
+    /// `path`: an absolute path.
+    pub fn for_manifest_path(manifest_path: &Path) -> CargoResult<SourceId> {
+        if crate::util::toml::is_embedded(manifest_path) {
+            Self::for_path(manifest_path)
+        } else {
+            Self::for_path(manifest_path.parent().unwrap())
+        }
+    }
+
     /// Creates a `SourceId` from a Git reference.
     pub fn for_git(url: &Url, reference: GitReference) -> CargoResult<SourceId> {
         SourceId::new(SourceKind::Git(reference), url.clone(), None)
@@ -393,6 +404,9 @@ impl SourceId {
                     .url
                     .to_file_path()
                     .expect("path sources cannot be remote");
+                if crate::util::toml::is_embedded(&path) {
+                    anyhow::bail!("Single file packages cannot be used as dependencies")
+                }
                 Ok(Box::new(PathSource::new(&path, self, gctx)))
             }
             SourceKind::Registry | SourceKind::SparseRegistry => Ok(Box::new(
@@ -581,8 +595,8 @@ impl PartialOrd for SourceId {
     }
 }
 
-// Custom comparison defined as canonical URL equality for git sources and URL
-// equality for other sources, ignoring the `precise` and `name` fields.
+// Custom comparison defined as source kind and canonical URL equality,
+// ignoring the `precise` and `name` fields.
 impl Ord for SourceId {
     fn cmp(&self, other: &SourceId) -> Ordering {
         // If our interior pointers are to the exact same `SourceIdInner` then
