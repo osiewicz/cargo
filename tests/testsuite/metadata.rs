@@ -1224,7 +1224,7 @@ fn workspace_metadata_with_dependencies_no_deps() {
                 name = "bar"
                 version = "0.5.0"
                 authors = ["wycats@example.com"]
-                
+
                 [dependencies]
                 baz = { path = "../baz/" }
                 artifact = { path = "../artifact/", artifact = "bin" }
@@ -1474,13 +1474,13 @@ fn workspace_metadata_with_dependencies_and_resolve() {
                 name = "artifact"
                 version = "0.5.0"
                 authors = []
-                
+
                 [lib]
                 crate-type = ["staticlib", "cdylib", "rlib"]
-                
+
                 [[bin]]
                 name = "bar-name"
-                
+
                 [[bin]]
                 name = "baz-name"
             "#,
@@ -1494,10 +1494,10 @@ fn workspace_metadata_with_dependencies_and_resolve() {
                 name = "bin-only-artifact"
                 version = "0.5.0"
                 authors = []
-                
+
                 [[bin]]
                 name = "a-name"
-                
+
                 [[bin]]
                 name = "b-name"
             "#,
@@ -4294,6 +4294,44 @@ fn dep_kinds_workspace() {
         .run();
 }
 
+#[cargo_test]
+fn build_dir() {
+    let p = project()
+        .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+        .file(
+            ".cargo/config.toml",
+            r#"
+            [build]
+            build-dir = "build-dir"
+            "#,
+        )
+        .build();
+
+    p.cargo("metadata -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
+        .with_stdout_data(
+            str![[r#"
+{
+  "build_directory": "[ROOT]/foo/build-dir",
+  "metadata": null,
+  "packages": "{...}",
+  "resolve": "{...}",
+  "target_directory": "[ROOT]/foo/target",
+  "version": 1,
+  "workspace_default_members": [
+    "path+[ROOTURL]/foo#0.0.1"
+  ],
+  "workspace_members": [
+    "path+[ROOTURL]/foo#0.0.1"
+  ],
+  "workspace_root": "[ROOT]/foo"
+}
+"#]]
+            .is_json(),
+        )
+        .run();
+}
+
 // Creating non-utf8 path is an OS-specific pain, so let's run this only on
 // linux, where arbitrary bytes work.
 #[cfg(target_os = "linux")]
@@ -4343,7 +4381,7 @@ fn workspace_metadata_with_dependencies_no_deps_artifact() {
                 name = "bar"
                 version = "0.5.0"
                 authors = ["wycats@example.com"]
-                
+
                 [dependencies]
                 baz = { path = "../baz/" }
                 baz-renamed = { path = "../baz/" }
@@ -4953,4 +4991,35 @@ local-time = 1979-05-27
             .is_json(),
         )
         .run();
+}
+
+#[cargo_test]
+fn metadata_ignores_build_target_configuration() -> anyhow::Result<()> {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+
+                [target.'cfg(something)'.dependencies]
+                foobar = "0.0.1"
+           "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+    Package::new("foobar", "0.0.1").publish();
+
+    let output1 = p
+        .cargo("metadata -q --format-version 1")
+        .exec_with_output()?;
+    let output2 = p
+        .cargo("metadata -q --format-version 1")
+        .env("CARGO_BUILD_TARGET", rustc_host())
+        .exec_with_output()?;
+    assert!(
+        output1.stdout == output2.stdout,
+        "metadata should not change when `CARGO_BUILD_TARGET` is set",
+    );
+    Ok(())
 }

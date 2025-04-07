@@ -854,7 +854,7 @@ impl LocalFingerprint {
         mtime_cache: &mut HashMap<PathBuf, FileTime>,
         checksum_cache: &mut HashMap<PathBuf, Checksum>,
         pkg: &Package,
-        target_root: &Path,
+        build_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
     ) -> CargoResult<Option<StaleItem>> {
@@ -867,8 +867,8 @@ impl LocalFingerprint {
             // the `dep_info` file itself whose mtime represents the start of
             // rustc.
             LocalFingerprint::CheckDepInfo { dep_info, checksum } => {
-                let dep_info = target_root.join(dep_info);
-                let Some(info) = parse_dep_info(pkg_root, target_root, &dep_info)? else {
+                let dep_info = build_root.join(dep_info);
+                let Some(info) = parse_dep_info(pkg_root, build_root, &dep_info)? else {
                     return Ok(Some(StaleItem::MissingFile(dep_info)));
                 };
                 for (key, previous) in info.env.iter() {
@@ -925,7 +925,7 @@ impl LocalFingerprint {
             LocalFingerprint::RerunIfChanged { output, paths } => Ok(find_stale_file(
                 mtime_cache,
                 checksum_cache,
-                &target_root.join(output),
+                &build_root.join(output),
                 paths.iter().map(|p| (pkg_root.join(p), None)),
                 false,
             )),
@@ -1169,7 +1169,7 @@ impl Fingerprint {
         mtime_cache: &mut HashMap<PathBuf, FileTime>,
         checksum_cache: &mut HashMap<PathBuf, Checksum>,
         pkg: &Package,
-        target_root: &Path,
+        build_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
     ) -> CargoResult<()> {
@@ -1278,7 +1278,7 @@ impl Fingerprint {
                 mtime_cache,
                 checksum_cache,
                 pkg,
-                target_root,
+                build_root,
                 cargo_exe,
                 gctx,
             )? {
@@ -1473,13 +1473,13 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
 
     // After we built the initial `Fingerprint` be sure to update the
     // `fs_status` field of it.
-    let target_root = target_root(build_runner);
+    let build_root = build_root(build_runner);
     let cargo_exe = build_runner.bcx.gctx.cargo_exe()?;
     fingerprint.check_filesystem(
         &mut build_runner.mtime_cache,
         &mut build_runner.checksum_cache,
         &unit.pkg,
-        &target_root,
+        &build_root,
         cargo_exe,
         build_runner.bcx.gctx,
     )?;
@@ -1517,8 +1517,10 @@ fn calculate_normal(
     };
 
     // Afterwards calculate our own fingerprint information.
-    let target_root = target_root(build_runner);
-    let local = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+    let build_root = build_root(build_runner);
+    let is_any_doc_gen = unit.mode.is_doc() || unit.mode.is_doc_scrape();
+    let rustdoc_depinfo_enabled = build_runner.bcx.gctx.cli_unstable().rustdoc_depinfo;
+    let local = if is_any_doc_gen && !rustdoc_depinfo_enabled {
         // rustdoc does not have dep-info files.
         let fingerprint = pkg_fingerprint(build_runner.bcx, &unit.pkg).with_context(|| {
             format!(
@@ -1529,7 +1531,7 @@ fn calculate_normal(
         vec![LocalFingerprint::Precalculated(fingerprint)]
     } else {
         let dep_info = dep_info_loc(build_runner, unit);
-        let dep_info = dep_info.strip_prefix(&target_root).unwrap().to_path_buf();
+        let dep_info = dep_info.strip_prefix(&build_root).unwrap().to_path_buf();
         vec![LocalFingerprint::CheckDepInfo {
             dep_info,
             checksum: build_runner.bcx.gctx.cli_unstable().checksum_freshness,
@@ -1541,7 +1543,12 @@ fn calculate_normal(
     let outputs = build_runner
         .outputs(unit)?
         .iter()
-        .filter(|output| !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary))
+        .filter(|output| {
+            !matches!(
+                output.flavor,
+                FileFlavor::DebugInfo | FileFlavor::Auxiliary | FileFlavor::Sbom
+            )
+        })
         .map(|output| output.path.clone())
         .collect();
 
@@ -1739,7 +1746,7 @@ fn build_script_local_fingerprints(
     // longstanding bug, in Cargo. Recent refactorings just made it painfully
     // obvious.
     let pkg_root = unit.pkg.root().to_path_buf();
-    let target_dir = target_root(build_runner);
+    let build_dir = build_root(build_runner);
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     let calculate =
         move |deps: &BuildDeps, pkg_fingerprint: Option<&dyn Fn() -> CargoResult<String>>| {
@@ -1772,7 +1779,7 @@ fn build_script_local_fingerprints(
             // them all here.
             Ok(Some(local_fingerprints_deps(
                 deps,
-                &target_dir,
+                &build_dir,
                 &pkg_root,
                 &env_config,
             )))
@@ -1808,7 +1815,7 @@ fn build_script_override_fingerprint(
 /// [`RunCustomBuild`]: crate::core::compiler::CompileMode::RunCustomBuild
 fn local_fingerprints_deps(
     deps: &BuildDeps,
-    target_root: &Path,
+    build_root: &Path,
     pkg_root: &Path,
     env_config: &Arc<HashMap<String, OsString>>,
 ) -> Vec<LocalFingerprint> {
@@ -1821,7 +1828,7 @@ fn local_fingerprints_deps(
         // absolute prefixes from them.
         let output = deps
             .build_script_output
-            .strip_prefix(target_root)
+            .strip_prefix(build_root)
             .unwrap()
             .to_path_buf();
         let paths = deps
@@ -1910,10 +1917,10 @@ pub fn dep_info_loc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Path
     build_runner.files().fingerprint_file_path(unit, "dep-")
 }
 
-/// Returns an absolute path that target directory.
+/// Returns an absolute path that build directory.
 /// All paths are rewritten to be relative to this.
-fn target_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
-    build_runner.bcx.ws.target_dir().into_path_unlocked()
+fn build_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
+    build_runner.bcx.ws.build_dir().into_path_unlocked()
 }
 
 /// Reads the value from the old fingerprint hash file and compare.

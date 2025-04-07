@@ -1,5 +1,5 @@
 use crate::core::compiler::artifact::match_artifacts_kind_with_targets;
-use crate::core::compiler::{CompileKind, RustcTargetData};
+use crate::core::compiler::{CompileKind, CompileKindFallback, RustcTargetData};
 use crate::core::dependency::DepKind;
 use crate::core::package::SerializedPackage;
 use crate::core::resolver::{features::CliFeatures, HasDevUnits, Resolve};
@@ -52,6 +52,11 @@ pub fn output_metadata(ws: &Workspace<'_>, opt: &OutputMetadataOptions) -> Cargo
             .collect(),
         resolve,
         target_directory: ws.target_dir().into_path_unlocked(),
+        build_directory: ws
+            .gctx()
+            .cli_unstable()
+            .build_dir
+            .then(|| ws.build_dir().into_path_unlocked()),
         version: VERSION,
         workspace_root: ws.root().to_path_buf(),
         metadata: ws.custom_metadata().cloned(),
@@ -68,6 +73,8 @@ pub struct ExportInfo {
     workspace_default_members: Vec<PackageIdSpec>,
     resolve: Option<MetadataResolve>,
     target_directory: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_directory: Option<PathBuf>,
     version: u32,
     workspace_root: PathBuf,
     metadata: Option<toml::Value>,
@@ -132,8 +139,16 @@ fn build_resolve_graph(
 ) -> CargoResult<(Vec<SerializedPackage>, MetadataResolve)> {
     // TODO: Without --filter-platform, features are being resolved for `host` only.
     // How should this work?
-    let requested_kinds =
-        CompileKind::from_requested_targets(ws.gctx(), &metadata_opts.filter_platforms)?;
+    //
+    // Otherwise note that "just host" is used as the fallback here if
+    // `filter_platforms` is empty to intentionally avoid reading
+    // `$CARGO_BUILD_TARGET` (or `build.target`) which makes sense for other
+    // subcommands like `cargo build` but does not fit with this command.
+    let requested_kinds = CompileKind::from_requested_targets_with_fallback(
+        ws.gctx(),
+        &metadata_opts.filter_platforms,
+        CompileKindFallback::JustHost,
+    )?;
     let mut target_data = RustcTargetData::new(ws, &requested_kinds)?;
     // Resolve entire workspace.
     let specs = Packages::All(Vec::new()).to_package_id_specs(ws)?;
