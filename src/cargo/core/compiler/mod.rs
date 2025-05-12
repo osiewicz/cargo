@@ -61,7 +61,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::fs::{self, File};
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -225,28 +225,53 @@ fn compile<'gctx>(
                     .collect::<Vec<_>>()
             });
 
-            let work = Work::new(move |state| {
-                let is_api_same = if let Some(all_deps) = all_dep_hashes {
-                    all_deps.into_iter().all(|hash| {
-                        let before_hash = hash.0.get();
-                        let after_hash = hash.1.get();
-                        let res = after_hash.is_none() || before_hash == after_hash;
-                        if !res {
-                            dbg!(&before_hash, &after_hash);
-                        }
-                        res
-                    })
-                } else {
-                    false
-                };
+            let work = Work::new({
+                let message_cache = build_runner.files().message_cache_path(unit).clone();
+                move |state| {
+                    let is_api_same = if let Some(all_deps) = all_dep_hashes {
+                        all_deps.into_iter().all(|hash| {
+                            let before_hash = hash.0.get();
+                            let after_hash = hash.1.get();
+                            let res = after_hash.is_none() || before_hash == after_hash;
+                            if !res {
+                                dbg!(&before_hash, &after_hash);
+                            }
+                            res
+                        })
+                    } else {
+                        false
+                    };
 
-                if !is_api_same {
-                    rustc_work.call(state)?;
-                } else {
-                    state.set_api_same();
-                    rustc_clean_job.call(state)?;
+                    // If a crate has a cached warning that points at a parent crate, we need to unconditionally
+                    let has_diagnostics = 'a: {
+                        if let Ok(f) = File::open(message_cache) {
+                            let reader = BufReader::new(f);
+                            let mut lines = reader.lines();
+                            while let Some(Ok(line)) = lines.next() {
+                                if let Ok(value) = serde_json::from_str::<
+                                    serde_json::Map<String, serde_json::Value>,
+                                >(&line)
+                                {
+                                    if let Some(level) = value.get("level").and_then(|v| v.as_str())
+                                    {
+                                        if level == "warning" {
+                                            break 'a true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    };
+
+                    if !is_api_same || has_diagnostics {
+                        rustc_work.call(state)?;
+                    } else {
+                        state.set_api_same();
+                        rustc_clean_job.call(state)?;
+                    }
+                    Ok(())
                 }
-                Ok(())
             });
 
             work.then(link_targets(build_runner, unit, false)?)
