@@ -50,12 +50,12 @@ impl ApiHash {
 
     pub fn set_old_hash(&self, hash: String) {
         let _result = self.old_hash.set(hash);
-        debug_assert!(_result.is_err());
+        debug_assert!(_result.is_ok());
     }
 
     pub fn set_new_hash(&self, hash: String) {
         let _result = self.new_hash.set(hash);
-        debug_assert!(_result.is_err());
+        debug_assert!(_result.is_ok());
     }
 
     pub fn get(&self) -> Option<String> {
