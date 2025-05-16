@@ -380,7 +380,7 @@ use std::fs::File;
 use std::hash::{self, Hash, Hasher};
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::format_err;
