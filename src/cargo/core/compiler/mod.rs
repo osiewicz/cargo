@@ -280,11 +280,6 @@ fn compile<'gctx>(
 
             work.then(link_targets(build_runner, unit, false)?)
         } else {
-            dbg!(
-                "Replay output cache",
-                mark_apis_as_same.is_none(),
-                unit.pkg.name()
-            );
             replay_output_cache_job
         };
         job.before(run_build.then(mark_apis_as_same.unwrap_or_else(|| Work::noop())));
