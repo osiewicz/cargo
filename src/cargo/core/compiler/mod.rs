@@ -195,17 +195,8 @@ fn compile<'gctx>(
     } else {
         let force = exec.force_rebuild(unit) || force_rebuild;
         let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-        job.before(if let Freshness::Dirty(reason) = job.freshness() {
-            let rustc_work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-                rustdoc(build_runner, unit)?
-            } else {
-                rustc(build_runner, unit, exec)?
-            };
-            let rustc_clean_job = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-                Work::noop()
-            } else {
-                rustc_noop(build_runner, unit, exec)?
-            };
+        // We need to replay output cache either when the job is fresh or if RDR took place.
+        let mark_apis_as_same = job.freshness().dirty_reason().and_then(|reason| {
             let is_outdated_dep = matches!(
                 reason,
                 DirtyReason::FsStatusOutdated(
@@ -224,58 +215,51 @@ fn compile<'gctx>(
                     })
                     .collect::<Vec<_>>()
             });
-
-            let work = Work::new({
-                let message_cache = build_runner.files().message_cache_path(unit).clone();
-                move |state| {
-                    let is_api_same = if let Some(all_deps) = all_dep_hashes {
-                        all_deps.into_iter().all(|hash| {
-                            let before_hash = hash.0.get();
-                            let after_hash = hash.1.get();
-                            let res = after_hash.is_none() || before_hash == after_hash;
-                            if !res {
-                                dbg!(&before_hash, &after_hash);
-                            }
-                            res
-                        })
-                    } else {
-                        false
-                    };
-
-                    // If a crate has a cached warning that points at a parent crate, we need to unconditionally
-                    let has_diagnostics = 'a: {
-                        if let Ok(f) = File::open(message_cache) {
-                            let reader = BufReader::new(f);
-                            let mut lines = reader.lines();
-                            while let Some(Ok(line)) = lines.next() {
-                                if let Ok(value) = serde_json::from_str::<
-                                    serde_json::Map<String, serde_json::Value>,
-                                >(&line)
-                                {
-                                    if let Some(level) = value.get("level").and_then(|v| v.as_str())
-                                    {
-                                        if level == "warning" {
-                                            break 'a true;
-                                        }
-                                    }
-                                }
+            let is_api_same = if let Some(all_deps) = all_dep_hashes {
+                all_deps.into_iter().all(|hash| {
+                    let before_hash = hash.0.get();
+                    let after_hash = hash.1.get();
+                    let res = after_hash.is_none() || before_hash == after_hash;
+                    if !res {
+                        dbg!(&before_hash, &after_hash);
+                    }
+                    res
+                })
+            } else {
+                false
+            };
+            is_api_same.then(|| {
+                Work::new(|state| {
+                    state.set_api_same();
+                    Ok(())
+                })
+            })
+        });
+        let replay_output_cache_job = job.freshness().is_dirty().then(|| {
+            let has_diagnostics = || {
+                let Ok(f) = File::open(build_runner.files().message_cache_path(unit)) else {
+                    return false;
+                };
+                let reader = BufReader::new(f);
+                let mut lines = reader.lines();
+                while let Some(Ok(line)) = lines.next() {
+                    if let Ok(value) =
+                        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&line)
+                    {
+                        if let Some(level) = value.get("level").and_then(|v| v.as_str()) {
+                            if level == "warning" || level == "error" {
+                                return false;
                             }
                         }
-                        false
-                    };
-
-                    if !is_api_same || has_diagnostics {
-                        rustc_work.call(state)?;
-                    } else {
-                        state.set_api_same();
-                        rustc_clean_job.call(state)?;
                     }
-                    Ok(())
                 }
-            });
 
-            work.then(link_targets(build_runner, unit, false)?)
-        } else {
+                true
+            };
+            mark_apis_as_same.is_none() || has_diagnostics()
+        });
+        let replay_output_cache_job = if replay_output_cache_job.is_none_or(std::convert::identity)
+        {
             // We always replay the output cache,
             // since it might contain future-incompat-report messages
             let show_diagnostics = unit.show_warnings(bcx.gctx)
@@ -290,7 +274,31 @@ fn compile<'gctx>(
             );
             // Need to link targets on both the dirty and fresh.
             work.then(link_targets(build_runner, unit, true)?)
-        });
+        } else {
+            Work::noop()
+        };
+
+        let run_build = if let Some(_) = job
+            .freshness()
+            .dirty_reason()
+            .filter(|_| mark_apis_as_same.is_none())
+        {
+            let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                rustdoc(build_runner, unit)?
+            } else {
+                rustc(build_runner, unit, exec)?
+            };
+
+            work.then(link_targets(build_runner, unit, false)?)
+        } else {
+            dbg!(
+                "Replay output cache",
+                mark_apis_as_same.is_none(),
+                unit.pkg.name()
+            );
+            replay_output_cache_job
+        };
+        job.before(run_build.then(mark_apis_as_same.unwrap_or_else(|| Work::noop())));
 
         job
     };
@@ -329,27 +337,6 @@ fn make_failed_scrape_diagnostic(
     )
 }
 
-fn rustc_noop(
-    build_runner: &mut BuildRunner<'_, '_>,
-    unit: &Unit,
-    exec: &Arc<dyn Executor>,
-) -> CargoResult<Work> {
-    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
-
-    exec.init(build_runner, unit);
-
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
-
-    return Ok(Work::new(move |_| {
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-
-        // This mtime shift allows Cargo to detect if a source file was
-        // modified in the middle of the build.
-        paths::set_file_time_no_err(dep_info_loc, timestamp);
-
-        Ok(())
-    }));
-}
 /// Creates a unit of work invoking `rustc` for building the `unit`.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,

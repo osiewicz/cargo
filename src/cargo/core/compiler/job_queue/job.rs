@@ -108,6 +108,12 @@ impl Freshness {
         matches!(self, Freshness::Dirty(_))
     }
 
+    pub fn dirty_reason(&self) -> Option<&DirtyReason> {
+        match self {
+            Freshness::Fresh => None,
+            Freshness::Dirty(dirty_reason) => Some(dirty_reason),
+        }
+    }
     pub fn is_fresh(&self) -> bool {
         matches!(self, Freshness::Fresh)
     }
