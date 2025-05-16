@@ -29,6 +29,40 @@ mod compilation_files;
 use self::compilation_files::CompilationFiles;
 pub use self::compilation_files::{Metadata, OutputFile, UnitHash};
 
+#[derive(Default)]
+pub struct ApiHash {
+    /// API hash from from the previous build (prior to the potential rebuild in the current build session).
+    /// Should be initialized at the point when this Unit is used by one of the dependants.
+    old_hash: OnceLock<String>,
+    /// API hash from the current compile session. Might not be initialized if this crate was not rebuilt
+    /// in the current build session.
+    new_hash: OnceLock<String>,
+}
+
+impl ApiHash {
+    pub fn has_stable_api(&self) -> bool {
+        let crate_rebuild_skipped = self.new_hash.get().is_none();
+        if !crate_rebuild_skipped {
+            debug_assert!(self.old_hash.get().is_some());
+        }
+        crate_rebuild_skipped || self.old_hash == self.new_hash
+    }
+
+    pub fn set_old_hash(&self, hash: String) {
+        let _result = self.old_hash.set(hash);
+        debug_assert!(_result.is_err());
+    }
+
+    pub fn set_new_hash(&self, hash: String) {
+        let _result = self.new_hash.set(hash);
+        debug_assert!(_result.is_err());
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.new_hash.get().or_else(|| self.old_hash.get()).cloned()
+    }
+}
+
 /// Collection of all the stuff that is needed to perform a build.
 ///
 /// Different from the [`BuildContext`], `Context` is a _mutable_ state used
@@ -48,7 +82,7 @@ pub struct BuildRunner<'a, 'gctx> {
     pub build_explicit_deps: HashMap<Unit, BuildDeps>,
     /// Fingerprints used to detect if a unit is out-of-date.
     pub fingerprints: HashMap<Unit, Arc<Fingerprint>>,
-    pub api_hashes: HashMap<Unit, Arc<(OnceLock<String>, OnceLock<String>)>>,
+    pub api_hashes: HashMap<Unit, Arc<ApiHash>>,
     /// Cache of file mtimes to reduce filesystem hits.
     pub mtime_cache: HashMap<PathBuf, FileTime>,
     /// Cache of file checksums to reduce filesystem reads.

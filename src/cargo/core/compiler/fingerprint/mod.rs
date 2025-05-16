@@ -400,6 +400,7 @@ use crate::util::interning::InternedString;
 use crate::util::{internal, path_args, StableHasher};
 use crate::{GlobalContext, CARGO_ENV};
 
+use super::build_runner::ApiHash;
 use super::custom_build::BuildDeps;
 use super::{BuildContext, BuildRunner, FileFlavor, Job, Unit, Work};
 
@@ -534,7 +535,7 @@ pub fn prepare_target(
             if let Some(new_local) = (gen_local)(&deps, None)? {
                 *fingerprint.local.lock().unwrap() = new_local;
             }
-            write_fingerprint(&loc, &fingerprint, api)
+            write_fingerprint(&loc, &fingerprint, &api)
         })
     } else {
         let api = build_runner
@@ -542,7 +543,7 @@ pub fn prepare_target(
             .entry(unit.clone())
             .or_default()
             .clone();
-        Work::new(move |_| write_fingerprint(&loc, &fingerprint, api))
+        Work::new(move |_| write_fingerprint(&loc, &fingerprint, &api))
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
@@ -1373,7 +1374,7 @@ impl DepFingerprint {
         let api_fingerprint = build_runner
             .api_hashes
             .get(&dep.unit)
-            .and_then(|api_hashes| api_hashes.1.get().or(api_hashes.0.get()).cloned());
+            .and_then(|api_hash| api_hash.get());
         Ok(DepFingerprint {
             pkg_id,
             name: dep.extern_crate_name,
@@ -1850,11 +1851,7 @@ fn local_fingerprints_deps(
 
 /// Writes the short fingerprint hash value to `<loc>`
 /// and logs detailed JSON information to `<loc>.json`.
-fn write_fingerprint(
-    loc: &Path,
-    fingerprint: &Fingerprint,
-    api_hash: Arc<(OnceLock<String>, OnceLock<String>)>,
-) -> CargoResult<()> {
+fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint, api_hash: &ApiHash) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
     // fingerprint::new().rustc == 0, make sure it doesn't make it to the file system.
     // This is mostly so outside tools can reliably find out what rust version this file is for,
@@ -1862,17 +1859,7 @@ fn write_fingerprint(
     let hash = fingerprint.hash_u64();
     debug!("write fingerprint ({:x}) : {}", hash, loc.display());
     paths::write(loc, util::to_hex(hash).as_bytes())?;
-    let api_hash = {
-        if let Some(hash) = api_hash.1.get() {
-            // We have a fresh hash from this session.
-            Some(hash.clone())
-        } else if let Some(hash) = api_hash.0.get() {
-            // Keep the same hash.
-            Some(hash.clone())
-        } else {
-            None
-        }
-    };
+    let api_hash = api_hash.get();
     let fingerprint = Fingerprint {
         api_hash,
         rustc: fingerprint.rustc,
@@ -1992,9 +1979,7 @@ fn _compare_old_fingerprint(
             .api_hashes
             .entry(unit.clone())
             .or_default()
-            .0
-            .set(api.clone())
-            .ok();
+            .set_old_hash(api.clone());
     }
     // Fingerprint can be empty after a failed rebuild (see comment in prepare_target).
     if !old_fingerprint_short.is_empty() {

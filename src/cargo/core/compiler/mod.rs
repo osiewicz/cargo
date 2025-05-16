@@ -197,6 +197,7 @@ fn compile<'gctx>(
         let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
         // We need to replay output cache either when the job is fresh or if RDR took place.
         let mark_apis_as_same = job.freshness().dirty_reason().and_then(|reason| {
+            // Are we rebuilding current crate because of a dependency change?
             let is_outdated_dep = matches!(
                 reason,
                 DirtyReason::FsStatusOutdated(
@@ -216,15 +217,7 @@ fn compile<'gctx>(
                     .collect::<Vec<_>>()
             });
             let is_api_same = if let Some(all_deps) = all_dep_hashes {
-                all_deps.into_iter().all(|hash| {
-                    let before_hash = hash.0.get();
-                    let after_hash = hash.1.get();
-                    let res = after_hash.is_none() || before_hash == after_hash;
-                    if !res {
-                        dbg!(&before_hash, &after_hash);
-                    }
-                    res
-                })
+                all_deps.into_iter().all(|hash| hash.has_stable_api())
             } else {
                 false
             };
@@ -278,11 +271,7 @@ fn compile<'gctx>(
             Work::noop()
         };
 
-        let run_build = if let Some(_) = job
-            .freshness()
-            .dirty_reason()
-            .filter(|_| mark_apis_as_same.is_none())
-        {
+        let run_build = if job.freshness().is_dirty() && mark_apis_as_same.is_none() {
             let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                 rustdoc(build_runner, unit)?
             } else {

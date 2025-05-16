@@ -682,9 +682,7 @@ impl<'gctx> DrainState<'gctx> {
                         .api_hashes
                         .entry(unit.clone())
                         .or_default()
-                        .1
-                        .set(hash)
-                        .unwrap();
+                        .set_new_hash(hash);
                 }
 
                 debug!("end ({:?}): {:?}", unit, result);
